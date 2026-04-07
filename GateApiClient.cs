@@ -13,7 +13,7 @@ public class GateApiClient
 {
     private readonly string _apiKey;
     private readonly string _apiSecret;
-    private readonly HttpClient _httpClient;
+    private static readonly HttpClient _httpClient = new HttpClient();
 
     private static readonly JsonSerializerOptions _jsonOptions = new()
     {
@@ -24,7 +24,6 @@ public class GateApiClient
     {
         _apiKey = apiKey;
         _apiSecret = apiSecret;
-        _httpClient = new HttpClient();
     }
 
     // Подпись для REST API
@@ -58,7 +57,7 @@ public class GateApiClient
         var json = await response.Content.ReadAsStringAsync();
         Log.Info($"[Gate Balance JSON] {json}");
         var data = JsonSerializer.Deserialize<GateBalanceResponse>(json, _jsonOptions);
-        return data?.Total ?? 0;
+        return decimal.Parse(data?.Total ?? "0", System.Globalization.CultureInfo.InvariantCulture);
     }
 
     // Открыть маркет ордер
@@ -71,7 +70,7 @@ public class GateApiClient
         {
             contract = symbol,
             size = isBuy ? (long)quantity : -(long)quantity,
-            price = "0",
+            price = 0,
             tif = "ioc"
         };
 
@@ -120,7 +119,7 @@ public class GateApiClient
         {
             contract = symbol,
             size = 0,
-            price = "0",
+            price = 0,
             tif = "ioc",
             close = true,
             auto_size = isLong ? "close_long" : "close_short"
@@ -180,30 +179,38 @@ public class GateApiClient
         var json = await response.Content.ReadAsStringAsync();
         var order = JsonSerializer.Deserialize<GateOrderResponse>(json, _jsonOptions);
 
+        long left = 0;
+        long size = 0;
+        if (order != null)
+        {
+            long.TryParse(order.Left, System.Globalization.NumberStyles.Any, System.Globalization.CultureInfo.InvariantCulture, out left);
+            long.TryParse(order.Size, System.Globalization.NumberStyles.Any, System.Globalization.CultureInfo.InvariantCulture, out size);
+        }
+
         return new OrderStatusInfo
         {
             Status = order?.Status ?? "Unknown",
-            IsFilled = order?.Status == "finished",
-            ExecutedQty = order?.SizeExecuted ?? 0
+            IsFilled = (order?.Status == "finished" || order?.Status == "cancelled") && left == 0,
+            ExecutedQty = order != null ? size - left : 0
         };
-    }
-
-    // Модели ответов
-    public void Dispose()
-    {
-        _httpClient?.Dispose();
     }
 
     // Модели ответов
     private class GateBalanceResponse
     {
-        public decimal Total { get; set; }
+        public string Total { get; set; } = string.Empty;
     }
 
     private class GateOrderResponse
     {
         public long Id { get; set; }
         public string Status { get; set; } = string.Empty;
-        public decimal SizeExecuted { get; set; }
+        public string Size { get; set; } = "0";
+        public string Left { get; set; } = "0";
+    }
+
+    public void Dispose()
+    {
+        // HttpClient is static and reused for the lifetime of the app.
     }
 }
