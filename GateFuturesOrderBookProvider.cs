@@ -93,16 +93,15 @@ public class GateFuturesOrderBookProvider : BaseOrderBookProvider
 
             // Подписываемся на апдейты (теперь с начальным снапшотом)
             Log.Info("[Gate Provider] Подписываемся на order book с начальным снапшотом...");
-            var subscribeTasks = new List<Task>();
             foreach (var client in _wsClients)
             {
                 var clientSymbols = client.GetSubscribedSymbols();
                 foreach (var symbol in clientSymbols)
                 {
-                    subscribeTasks.Add(client.SubscribeOrderBook(symbol, limit: 20, interval: "200ms"));
+                    await client.SubscribeOrderBook(symbol, limit: 20, interval: "200ms");
+                    await Task.Delay(120, cancellationToken);
                 }
             }
-            await Task.WhenAll(subscribeTasks);
 
             Log.Info($"[Gate Provider] ✓ Подписано {_expectedSymbolCount} символов через {_wsClients.Count} клиентов");
         }
@@ -188,7 +187,7 @@ public class GateFuturesWsClient : IAsyncDisposable, IDisposable
 
     public async Task SubscribeOrderBook(string contract, int limit = 20, string interval = "200ms")
     {
-        var payload = new object[] { contract, limit, interval };
+        var payload = new object[] { contract, limit.ToString(), interval };
         await SubscribeAsync("futures.order_book", payload);
         _subscribedSymbols.Add(contract);
     }
@@ -262,11 +261,13 @@ public class GateFuturesWsClient : IAsyncDisposable, IDisposable
                 {
                     Log.Warn("[Gate Futures WS] Connection lost, attempting reconnect...");
                     await Task.Delay(5000, _cts.Token); // Ждём 5 сек перед переподключением
+                    try { _ws?.Abort(); _ws?.Dispose(); } catch { }
                     await ConnectAsync();
                     // Переподписываемся на все символы
                     foreach (var symbol in _subscribedSymbols)
                     {
                         await SubscribeOrderBook(symbol);
+                        await Task.Delay(120, _cts.Token);
                     }
                     continue;
                 }
@@ -307,6 +308,10 @@ public class GateFuturesWsClient : IAsyncDisposable, IDisposable
 
             if (channel == "futures.order_book")
             {
+                if (!result.TryGetProperty("s", out var contractEl)) return;
+                string contract = contractEl.GetString()!;
+                if (string.IsNullOrEmpty(contract)) return;
+
                 // Проверяем тип события
                 if (result.TryGetProperty("e", out var eventEl))
                 {
@@ -314,13 +319,15 @@ public class GateFuturesWsClient : IAsyncDisposable, IDisposable
                     if (eventType == "all")
                     {
                         // Это начальный снапшот
-                        HandleOrderBookSnapshot(result);
+                        HandleOrderBookSnapshot(result, contract);
                     }
                     else if (eventType == "update")
                     {
                         // Это инкрементальный апдейт
-                        var update = JsonSerializer.Deserialize<GateOrderBookUpdate>(result.GetRawText())!;
-                        OnOrderBookUpdate?.Invoke(update.Contract, update);
+                        var options = new JsonSerializerOptions { PropertyNameCaseInsensitive = true };
+                        var update = JsonSerializer.Deserialize<GateOrderBookUpdate>(result.GetRawText(), options)!;
+                        Log.Info($"[Gate] Applying update for {contract}");
+                        OnOrderBookUpdate?.Invoke(contract, update);
                     }
                 }
                 else
@@ -328,8 +335,9 @@ public class GateFuturesWsClient : IAsyncDisposable, IDisposable
                     // Возможно, это update без 'e'
                     try
                     {
-                        var update = JsonSerializer.Deserialize<GateOrderBookUpdate>(result.GetRawText())!;
-                        OnOrderBookUpdate?.Invoke(update.Contract, update);
+                        var options = new JsonSerializerOptions { PropertyNameCaseInsensitive = true };
+                        var update = JsonSerializer.Deserialize<GateOrderBookUpdate>(result.GetRawText(), options)!;
+                        OnOrderBookUpdate?.Invoke(contract, update);
                     }
                     catch (Exception ex)
                     {
@@ -344,12 +352,12 @@ public class GateFuturesWsClient : IAsyncDisposable, IDisposable
         }
     }
 
-    private void HandleOrderBookSnapshot(JsonElement result)
+    private void HandleOrderBookSnapshot(JsonElement result, string contract)
     {
         try
         {
-            if (!result.TryGetProperty("contract", out var contractEl)) return;
-            string contract = contractEl.GetString()!;
+            if (string.IsNullOrEmpty(contract)) return;
+            Log.Info($"[Gate] Applying snapshot for {contract}");
 
             var bids = _bids.GetOrAdd(contract, _ => new SortedDictionary<decimal, long>(Comparer<decimal>.Create((a, b) => b.CompareTo(a))));
             var asks = _asks.GetOrAdd(contract, _ => new SortedDictionary<decimal, long>());
@@ -398,6 +406,7 @@ public class GateFuturesWsClient : IAsyncDisposable, IDisposable
 
     public void ApplyOrderBookUpdate(GateOrderBookUpdate upd)
     {
+        Log.Info($"[Gate] Applying update for {upd.Contract}, S: '{upd.S}'");
         var bids = _bids.GetOrAdd(upd.Contract, _ => new SortedDictionary<decimal, long>(Comparer<decimal>.Create((a, b) => b.CompareTo(a))));
         var asks = _asks.GetOrAdd(upd.Contract, _ => new SortedDictionary<decimal, long>());
 
@@ -418,6 +427,12 @@ public class GateFuturesWsClient : IAsyncDisposable, IDisposable
                 if (level.S == 0) asks.Remove(price);
                 else asks[price] = level.S;
             }
+        }
+
+        // Если это первый update для контракта, считаем его готовым
+        if (_receivedSymbols.Add(upd.Contract))
+        {
+            _checkAndSetReady(upd.Contract);
         }
     }
 
@@ -456,16 +471,19 @@ public class GateFuturesWsClient : IAsyncDisposable, IDisposable
 
 public class GateOrderBookUpdate
 {
+    [System.Text.Json.Serialization.JsonPropertyName("t")]
     public long T { get; set; }
+    [System.Text.Json.Serialization.JsonPropertyName("s")]
     public string S { get; set; } = string.Empty;
+    public string Contract => S;
+    [System.Text.Json.Serialization.JsonPropertyName("u")]
     public long U { get; set; }
+    [System.Text.Json.Serialization.JsonPropertyName("uu")]
     public long Uu { get; set; }
     [System.Text.Json.Serialization.JsonPropertyName("b")]
     public List<List<string>> B { get; set; } = new();
     [System.Text.Json.Serialization.JsonPropertyName("a")]
     public List<List<string>> A { get; set; } = new();
-
-    public string Contract => S;
 
     public List<GateOrderBookLevel> Bids => B.Select(x => new GateOrderBookLevel { P = x[0], S = long.Parse(x[1], System.Globalization.CultureInfo.InvariantCulture) }).ToList();
     public List<GateOrderBookLevel> Asks => A.Select(x => new GateOrderBookLevel { P = x[0], S = long.Parse(x[1], System.Globalization.CultureInfo.InvariantCulture) }).ToList();
